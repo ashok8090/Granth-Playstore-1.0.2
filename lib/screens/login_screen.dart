@@ -1,0 +1,565 @@
+/// Round 15: the first-launch login page. Shown once before the dashboard to anyone not signed
+/// in. Login is optional by default ("बाद में" skips it, remembered); only when the admin sets
+/// `ui.login_required:true` is it compulsory (also for users who skipped before). Back here is
+/// Back on the app's first screen, so it leaves the app.
+library;
+
+import 'dart:math' as math;
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_svg/flutter_svg.dart';
+import 'package:package_info_plus/package_info_plus.dart';
+
+import '../services/firebase_bridge.dart';
+import '../services/file_actions.dart';
+import '../services/native_bridge.dart';
+import '../services/remote_config.dart';
+import '../services/storage.dart';
+import '../state/motion.dart';
+import '../state/toast.dart';
+import '../theme/colors.dart';
+import '../widgets/common.dart';
+import '../theme/app_theme.dart';
+import 'legal_screen.dart' show LegalStandaloneScreen;
+
+/// Shows [LoginPage] in front of [child] until the user signs in or skips.
+class LoginGate extends StatefulWidget {
+  const LoginGate({super.key, required this.child});
+  final Widget child;
+
+  /// Tests turn the gate off (they boot straight into the dashboard).
+  static bool enabled = true;
+
+  static bool get seen => Store.I.getString(Store.kLoginSeen) == '1';
+
+  /// §21: compulsory only when `ui.login_required` is exactly true; missing → optional.
+  static bool get required => RemoteConfig.I.uiLoginRequired;
+  static void markSeen() => Store.I.setString(Store.kLoginSeen, '1');
+
+  /// Round-3: the terms version accepted on this device (0 = never).
+  static int get termsAccepted => int.tryParse(Store.I.getString(Store.kTermsAccepted) ?? '') ?? 0;
+  static void acceptTerms(int v) => Store.I.setString(Store.kTermsAccepted, '$v');
+
+  /// Signed-in users (new or already signed in before this update) must accept the current
+  /// terms version; a newer `ui.terms.version` asks again.
+  static bool get needsTerms => enabled && Store.I.persistent && FirebaseBridge.I.signedIn && RemoteConfig.I.uiTerms.version > termsAccepted;
+
+  @override
+  State<LoginGate> createState() => _LoginGateState();
+}
+
+class _LoginGateState extends State<LoginGate> {
+  bool _skipped = false;
+  bool get _show => LoginGate.enabled && !FirebaseBridge.I.signedIn && (LoginGate.required || (!LoginGate.seen && !_skipped));
+
+  @override
+  void initState() {
+    super.initState();
+    FirebaseBridge.I.addListener(_auth);
+    RemoteConfig.I.addListener(_cfg);
+    Store.I.adopted.addListener(_cfg);
+  }
+
+  void _cfg() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    FirebaseBridge.I.removeListener(_auth);
+    RemoteConfig.I.removeListener(_cfg);
+    Store.I.adopted.removeListener(_cfg);
+    super.dispose();
+  }
+
+  bool _wasIn = FirebaseBridge.I.signedIn;
+
+  void _auth() {
+    final inNow = FirebaseBridge.I.signedIn;
+    if (_wasIn && !inNow) _skipped = false; // logged out: back to the login gate
+    _wasIn = inNow;
+    if (inNow && !LoginGate.seen) {
+      _done();
+    } else if (mounted) {
+      setState(() {});
+    }
+  }
+
+  void _done() {
+    LoginGate.markSeen();
+    if (mounted) setState(() => _skipped = true);
+  }
+
+  @override
+  Widget build(BuildContext context) => AnimatedSwitcher(
+    duration: const Duration(milliseconds: 320),
+    child: _show
+        ? LoginPage(key: const ValueKey('login-page'), onSkip: LoginGate.required ? null : _done)
+        : LoginGate.needsTerms
+        ? TermsPage(
+            key: const ValueKey('terms-page'),
+            terms: RemoteConfig.I.uiTerms,
+            onAccept: () {
+              LoginGate.acceptTerms(RemoteConfig.I.uiTerms.version);
+              setState(() {});
+            },
+            onDecline: () => FirebaseBridge.I.signOut(),
+          )
+        : KeyedSubtree(key: const ValueKey('login-passed'), child: widget.child),
+  );
+}
+
+const _gLogo =
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>';
+
+/// Google's "Sign in with Google" button (light theme: white, grey border, the 4-colour G).
+class GoogleSignInButton extends StatelessWidget {
+  const GoogleSignInButton({super.key, required this.onTap, this.busy = false});
+  final VoidCallback onTap;
+  final bool busy;
+  @override
+  Widget build(BuildContext context) => Material(
+    color: Colors.white,
+    shape: RoundedRectangleBorder(
+      borderRadius: BorderRadius.circular(24),
+      side: const BorderSide(color: Color(0xFF747775)),
+    ),
+    child: InkWell(
+      customBorder: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+      onTap: busy ? null : onTap,
+      child: SizedBox(
+        height: 48,
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            busy ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2.2)) : SvgPicture.string(_gLogo, width: 20, height: 20),
+            const SizedBox(width: 12),
+            Text(
+              busy ? 'Signing in…' : 'Sign in with Google',
+              style: const TextStyle(fontFamily: 'DMSans', fontSize: 15.5, fontWeight: FontWeight.w600, color: Color(0xFF1F1F1F), letterSpacing: 0.25),
+            ),
+          ],
+        ),
+      ),
+    ),
+  );
+}
+
+class LoginPage extends StatelessWidget {
+  const LoginPage({super.key, required this.onSkip});
+  final VoidCallback? onSkip;
+
+  static const _logo = 'assets/brand/app_logo.png';
+
+  Widget _feature(String icon, String label) => Column(mainAxisSize: MainAxisSize.min, children: [
+        Container(
+          width: 46,
+          height: 46,
+          alignment: Alignment.center,
+          decoration: BoxDecoration(color: GColors.paper, borderRadius: BorderRadius.circular(14), border: Border.all(color: GColors.goldLight)),
+          child: GIcon(icon, size: 20, color: GColors.maroon),
+        ),
+        const SizedBox(height: 6),
+        Text(label, style: GText.sans(size: 12, weight: FontWeight.w700, color: GColors.brown)),
+      ]);
+
+  /// t408 (approved 02-login-v1-logo): aurora background, "बाद में ›" top right, the arch card
+  /// with the real logo, the bottom sheet with Google sign-in. Same buttons and callbacks.
+  @override
+  Widget build(BuildContext context) => PopScope(
+    canPop: false,
+    onPopInvokedWithResult: (didPop, _) {
+      if (!didPop) NativeBridge.exitApp().catchError((Object _) => SystemNavigator.pop());
+    },
+    child: Scaffold(
+      backgroundColor: Theme.of(context).scaffoldBackgroundColor,
+      body: Stack(children: [
+        const Positioned.fill(child: AuroraBackground()),
+        SafeArea(
+          bottom: false,
+          child: ListenableBuilder(
+            listenable: FirebaseBridge.I,
+            builder: (context, _) => Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                SizedBox(
+                  height: 52,
+                  child: onSkip == null
+                      ? null
+                      : Align(
+                          alignment: Alignment.centerRight,
+                          child: Padding(
+                            padding: const EdgeInsets.only(right: 18),
+                            child: Pressable(
+                              key: const ValueKey('login-skip-top'),
+                              onTap: onSkip,
+                              child: Container(
+                                padding: const EdgeInsets.fromLTRB(16, 8, 10, 8),
+                                decoration: BoxDecoration(color: GColors.paper, borderRadius: BorderRadius.circular(999), border: Border.all(color: GColors.goldLight)),
+                                child: Row(mainAxisSize: MainAxisSize.min, children: [
+                                  Text('बाद में', style: GText.sans(size: 14, weight: FontWeight.w700, color: GColors.maroon)),
+                                  const SizedBox(width: 4),
+                                  const GIcon('chevron-right', size: 16, color: GColors.maroon),
+                                ]),
+                              ),
+                            ),
+                          ),
+                        ),
+                ),
+                Expanded(
+                  child: Center(
+                    child: SingleChildScrollView(
+                      padding: const EdgeInsets.symmetric(horizontal: 28),
+                      child: Container(
+                        key: const ValueKey('login-arch'),
+                        constraints: const BoxConstraints(maxWidth: 400),
+                        padding: const EdgeInsets.fromLTRB(20, 40, 20, 24),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFFFFFFF).withValues(alpha: 0.72),
+                          borderRadius: const BorderRadius.vertical(top: Radius.circular(200), bottom: Radius.circular(28)),
+                          border: Border.all(color: GColors.goldLight, width: 1.2),
+                        ),
+                        child: Column(mainAxisSize: MainAxisSize.min, children: [
+                          Image.asset(_logo, width: 236, filterQuality: FilterQuality.medium, semanticLabel: 'ग्रंथ प्रबंधन'),
+                          const SizedBox(height: 14),
+                          Text('सत ग्रंथों के प्रमाण, एक जगह', textAlign: TextAlign.center, style: GText.sans(size: 15.5, weight: FontWeight.w600, color: GColors.brown)),
+                          const SizedBox(height: 22),
+                          Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
+                            _feature('library', 'पवित्र ग्रंथ'),
+                            _feature('image', 'शास्त्र प्रमाण'),
+                            _feature('sparkles', 'तत्त्व AI'),
+                          ]),
+                        ]),
+                      ),
+                    ),
+                  ),
+                ),
+                Container(
+                  padding: EdgeInsets.fromLTRB(24, 22, 24, 14 + MediaQuery.paddingOf(context).bottom),
+                  decoration: const BoxDecoration(
+                    color: Color(0xFFFFFFFF),
+                    borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+                    boxShadow: [BoxShadow(color: Color(0x1A4A2C0A), blurRadius: 18, offset: Offset(0, -4))],
+                  ),
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, mainAxisSize: MainAxisSize.min, children: [
+                    if (onSkip != null)
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 8),
+                        child: Text('लॉगिन वैकल्पिक है', textAlign: TextAlign.center, style: GText.sans(size: 13, weight: FontWeight.w700, color: GColors.saffronDark)),
+                      ),
+                    Text(
+                      'लॉगिन करने पर आपका नाम, Gmail और आँकड़े अकाउंट में दिखेंगे।',
+                      textAlign: TextAlign.center,
+                      style: GText.sans(size: 13.5, color: GColors.muted, height: 1.45),
+                    ),
+                    const SizedBox(height: 14),
+                    GoogleSignInButton(
+                      key: const ValueKey('login-google'),
+                      busy: FirebaseBridge.I.busy,
+                      onTap: () async {
+                        final e = await FirebaseBridge.I.signIn();
+                        if (e != null) Toast.show(e);
+                      },
+                    ),
+                    // Round-2: the Toast layer lives in HomeShell, which is not mounted behind this
+                    // page, so progress and the error code are shown right here.
+                    if (FirebaseBridge.I.busy && FirebaseBridge.I.stage != null)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 10),
+                        child: Text(
+                          FirebaseBridge.I.stage!,
+                          key: const ValueKey('login-stage'),
+                          textAlign: TextAlign.center,
+                          style: GText.sans(size: 13.5, color: GColors.brown),
+                        ),
+                      ),
+                    if (!FirebaseBridge.I.busy && FirebaseBridge.I.error != null)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 10),
+                        child: SelectableText(
+                          FirebaseBridge.I.error!,
+                          key: const ValueKey('login-error'),
+                          textAlign: TextAlign.center,
+                          style: GText.sans(size: 13.5, color: const Color(0xFFB3261E)),
+                        ),
+                      ),
+                    const SizedBox(height: 6),
+                    if (onSkip != null)
+                      Center(
+                        child: TextButton(
+                          key: const ValueKey('login-skip'),
+                          onPressed: onSkip,
+                          child: Text(
+                            'बाद में — बिना लॉगिन आगे बढ़ें',
+                            style: GText.sans(size: 14.5, weight: FontWeight.w700, color: GColors.brown),
+                          ),
+                        ),
+                      ),
+                    // t430 (Goutam): both red links open the policy cards right here, before
+                    // sign-in (a big enough tap area around the small text).
+                    Pressable(
+                      key: const ValueKey('login-legal'),
+                      onTap: () => LegalStandaloneScreen.open(context),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 8),
+                        child: Text.rich(
+                          TextSpan(children: [
+                            const TextSpan(text: 'आगे बढ़ने पर '),
+                            TextSpan(text: 'नियम और शर्तें', style: GText.sans(size: 11.5, weight: FontWeight.w700, color: GColors.maroon).copyWith(decoration: TextDecoration.underline)),
+                            const TextSpan(text: ' व '),
+                            TextSpan(text: 'गोपनीयता नीति', style: GText.sans(size: 11.5, weight: FontWeight.w700, color: GColors.maroon).copyWith(decoration: TextDecoration.underline)),
+                            const TextSpan(text: ' लागू होंगी'),
+                          ]),
+                          textAlign: TextAlign.center,
+                          style: GText.sans(size: 11.5, color: GColors.muted),
+                        ),
+                      ),
+                    ),
+                  ]),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ]),
+    ),
+  );
+}
+
+/// t408 (approved FLUTTER_ANIMATED_LOGIN_BG): cream gradient with 4 soft colour blobs on slow
+/// orbits (16 s loop, RadialGradient — no real blur). Still at t = 0 with reduced motion.
+class AuroraBackground extends StatefulWidget {
+  const AuroraBackground({super.key});
+  @override
+  State<AuroraBackground> createState() => _AuroraBackgroundState();
+}
+
+class _AuroraBackgroundState extends State<AuroraBackground> with SingleTickerProviderStateMixin {
+  late final AnimationController _c = AnimationController(vsync: this, duration: const Duration(seconds: 16));
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (Motion.on(context)) {
+      if (!_c.isAnimating) _c.repeat();
+    } else {
+      _c.stop();
+      _c.value = 0;
+    }
+  }
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  Widget _blob(double t, double size, Color color, double r, bool cw, {double? l, double? rt, required double top}) {
+    final a = (cw ? 1 : -1) * 2 * math.pi * t;
+    return Positioned(
+      left: l,
+      right: rt,
+      top: top,
+      child: Transform.translate(
+        offset: Offset(math.cos(a), math.sin(a)) * r,
+        child: Container(
+          width: size,
+          height: size,
+          decoration: BoxDecoration(shape: BoxShape.circle, gradient: RadialGradient(colors: [color, color.withValues(alpha: 0)])),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) => RepaintBoundary(
+        child: AnimatedBuilder(
+          animation: Listenable.merge([_c, AppTheme.I]),
+          builder: (_, _) {
+            final t = _c.value;
+            return Stack(fit: StackFit.expand, children: [
+              // t430 (Goutam): the colours themselves drift slowly — the gradient turns once
+              // per 16 s cycle (admin `theme.login_gradient`, else the bundled peach/saffron).
+              DecoratedBox(
+                key: const ValueKey('login-gradient'),
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment(math.cos(2 * math.pi * t) * 1.2, -1 + 0.6 * math.sin(2 * math.pi * t)),
+                    end: Alignment(-math.cos(2 * math.pi * t) * 1.2, 1 - 0.6 * math.sin(2 * math.pi * t)),
+                    colors: AppTheme.I.loginGradient,
+                  ),
+                ),
+              ),
+              _blob(t, 260, const Color(0x80F5C878), 40, false, rt: -60, top: -60),
+              _blob(t, 340, const Color(0x61E8821A), 46, true, l: -90, top: 40),
+              _blob(t, 300, const Color(0x387B1F2E), 58, false, rt: -110, top: 180),
+              _blob(t, 360, const Color(0x66C9A84C), 52, true, l: 40, top: 430),
+            ]);
+          },
+        ),
+      );
+}
+
+/// Round-3: the terms page, shown after Google login and before the app. No skip; Back is the
+/// same as on the login page (it leaves the app).
+class TermsPage extends StatelessWidget {
+  const TermsPage({super.key, required this.terms, required this.onAccept, required this.onDecline});
+  final TermsInfo terms;
+  final VoidCallback onAccept, onDecline;
+
+  /// A faithful short form of the Hindi terms (granth-management.web.app/terms, version 1).
+  static const points = [
+    'ऐप की सामग्री केवल व्यक्तिगत, अध्ययन व धार्मिक उपयोग के लिए है; इसे बेचना या गलत रूप में प्रस्तुत करना मना है।',
+    'Google से लॉगिन वैकल्पिक है; अपने खाते की सुरक्षा आपकी ज़िम्मेदारी है।',
+    'AI के जवाब स्वचालित हैं और गलत हो सकते हैं; मूल ग्रंथ/प्रमाण से जाँच करें। AI से अवैध, अपमानजनक या हानिकारक प्रश्न न पूछें।',
+    'ऐप "जैसा है" दिया जाता है; सेवा कभी भी बदली या बंद की जा सकती है। दुरुपयोग पर पहुँच रोकी जा सकती है, और शर्तें बदलने पर ऐप दोबारा सहमति माँग सकता है।',
+  ];
+
+  @override
+  Widget build(BuildContext context) => PopScope(
+    canPop: false,
+    onPopInvokedWithResult: (didPop, _) {
+      if (!didPop) NativeBridge.exitApp().catchError((Object _) => SystemNavigator.pop());
+    },
+    child: Scaffold(
+      backgroundColor: Theme.of(context).scaffoldBackgroundColor,
+      body: Container(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(begin: Alignment.topCenter, end: Alignment.bottomCenter, colors: [Color(0xFFFFF7EA), GColors.cream]),
+        ),
+        child: SafeArea(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Expanded(
+                child: SingleChildScrollView(
+                  padding: const EdgeInsets.fromLTRB(24, 28, 24, 12),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Center(child: Image.asset('assets/brand/app_book.png', width: 140, filterQuality: FilterQuality.medium)),
+                      const SizedBox(height: 18),
+                      Text(
+                        'नियम और शर्तें',
+                        textAlign: TextAlign.center,
+                        style: GText.display(size: 28, color: const Color(0xFF7B1F2E)),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        'Terms & Conditions',
+                        textAlign: TextAlign.center,
+                        style: GText.sans(size: 13, color: GColors.muted),
+                      ),
+                      const SizedBox(height: 20),
+                      Container(
+                        padding: const EdgeInsets.all(16),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFFFFFFF),
+                          borderRadius: BorderRadius.circular(18),
+                          border: Border.all(color: GColors.gold.withValues(alpha: 0.55)),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              'आगे बढ़ने से पहले संक्षेप में:',
+                              style: GText.sans(size: 14.5, weight: FontWeight.w700, color: GColors.brown),
+                            ),
+                            const SizedBox(height: 10),
+                            for (final p in points)
+                              Padding(
+                                padding: const EdgeInsets.only(bottom: 8),
+                                child: Row(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text('•  ', style: GText.sans(size: 14, color: GColors.maroon)),
+                                    Expanded(
+                                      child: Text(p, style: GText.sans(size: 14, color: GColors.text, height: 1.45)),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      Wrap(
+                        alignment: WrapAlignment.center,
+                        children: [
+                          TextButton(
+                            key: const ValueKey('terms-link'),
+                            onPressed: () => FileActions.openUrl(terms.url).catchError((Object _) {}),
+                            child: Text(
+                              'पूरे नियम पढ़ें',
+                              style: GText.sans(size: 14.5, weight: FontWeight.w700, color: GColors.maroon).copyWith(decoration: TextDecoration.underline),
+                            ),
+                          ),
+                          TextButton(
+                            key: const ValueKey('privacy-link'),
+                            onPressed: () => FileActions.openUrl(terms.privacyUrl).catchError((Object _) {}),
+                            child: Text(
+                              'गोपनीयता नीति',
+                              style: GText.sans(size: 14.5, weight: FontWeight.w700, color: GColors.maroon).copyWith(decoration: TextDecoration.underline),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(24, 6, 24, 18),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Text(
+                      '"स्वीकार करें" दबाकर आप इन नियमों (संस्करण ${terms.version}) से सहमत होते हैं।',
+                      textAlign: TextAlign.center,
+                      style: GText.sans(size: 12.5, color: GColors.muted, height: 1.4),
+                    ),
+                    const SizedBox(height: 10),
+                    FilledButton(
+                      key: const ValueKey('terms-accept'),
+                      style: FilledButton.styleFrom(
+                        backgroundColor: GColors.maroon,
+                        foregroundColor: GColors.paper,
+                        minimumSize: const Size.fromHeight(50),
+                        shape: const StadiumBorder(),
+                      ),
+                      onPressed: onAccept,
+                      child: Text(
+                        'स्वीकार करें',
+                        style: GText.sans(size: 16, weight: FontWeight.w700, color: GColors.paper),
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    TextButton(
+                      key: const ValueKey('terms-decline'),
+                      onPressed: onDecline,
+                      child: Text(
+                        'अस्वीकार (लॉगआउट करें)',
+                        style: GText.sans(size: 14, weight: FontWeight.w600, color: GColors.muted),
+                      ),
+                    ),
+                    // the app version, read at runtime
+                    FutureBuilder<PackageInfo>(
+                      future: PackageInfo.fromPlatform().catchError((Object _) => PackageInfo(appName: '', packageName: '', version: '', buildNumber: '')),
+                      builder: (context, snap) => Text(
+                        snap.data == null || snap.data!.version.isEmpty ? '' : 'ऐप संस्करण ${snap.data!.version}',
+                        key: const ValueKey('terms-app-version'),
+                        textAlign: TextAlign.center,
+                        style: GText.sans(size: 11.5, color: GColors.muted),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    ),
+  );
+}

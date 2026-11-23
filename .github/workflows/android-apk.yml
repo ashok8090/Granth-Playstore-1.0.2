@@ -1,0 +1,312 @@
+name: Playstore - 1.0.2
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      shorebird_release:
+        description: 'Create the Shorebird release (code push) for this version — run ONCE per version'
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      EXPECTED_SHA256: 68c7cf34ecf0fada2105c265d2595496baa1bbc97c3fddbc35d21dbe8d0eddde
+      # Signing + builds only on push to main or manual runs (never on PRs, incl. forks).
+      DO_SIGN: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch' }}
+      EXPECTED_PACKAGE: com.granth.app.user
+      # Shorebird (code push): only on a manual run with shorebird_release=true, and only once
+      # shorebird.yaml (app_id) is committed. Normal pushes keep the plain Flutter build.
+      DO_SHOREBIRD: ${{ github.event_name == 'workflow_dispatch' && inputs.shorebird_release == true }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ github.event_name == 'pull_request' }}
+          cache-cleanup: never
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.47.7
+          cache: true
+
+      - name: Cache pub
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+          key: pub-${{ runner.os }}-${{ hashFiles('**/pubspec.lock') }}
+          restore-keys: |
+            pub-${{ runner.os }}-
+
+      - name: Set up Shorebird
+        if: env.DO_SIGN == 'true' && env.DO_SHOREBIRD == 'true' && hashFiles('shorebird.yaml') != ''
+        uses: shorebirdtech/setup-shorebird@v1
+        with:
+          cache: true
+
+      - run: flutter pub get
+
+      - name: Light tests (PRs only, keeps signed builds fast)
+        if: github.event_name == 'pull_request'
+        run: flutter test
+
+      - name: Set up signing (keystore, key.properties, google-services.json)
+        if: env.DO_SIGN == 'true'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          set +x
+          umask 077
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/satlok.keystore"
+          {
+            echo "storeFile=$RUNNER_TEMP/satlok.keystore"
+            echo "storePassword=$KEYSTORE_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=$KEY_PASSWORD"
+          } > android/key.properties
+          printf '%s' "$GOOGLE_SERVICES_JSON" > android/app/google-services.json
+
+      - name: Build arm64 APK and AAB
+        if: env.DO_SIGN == 'true'
+        env:
+          APP_KEY: ${{ secrets.APP_KEY }}
+          SHOREBIRD_TOKEN: ${{ secrets.SHOREBIRD_TOKEN }}
+        run: |
+          set +x
+          args=""
+          if [ -n "$APP_KEY" ]; then
+            printf '{"APP_KEY":"%s"}' "$APP_KEY" > "$RUNNER_TEMP/dd.json"
+            args="--dart-define-from-file=$RUNNER_TEMP/dd.json"
+          fi
+          mkdir -p dist
+          if [ "$DO_SHOREBIRD" = "true" ] && [ -f shorebird.yaml ]; then
+            [ -n "$SHOREBIRD_TOKEN" ] || { echo "::error::SHOREBIRD_TOKEN secret missing"; exit 1; }
+            # Shorebird release (Satlok-signed by Gradle): AAB for Play, arm64-only APK (no universal)
+            shorebird release android --artifact aab $args
+            cp build/app/outputs/bundle/release/app-release.aab dist/granth.aab
+            shorebird release android --artifact apk --target-platform android-arm64 $args
+            cp build/app/outputs/flutter-apk/app-release.apk dist/granth-arm64-v8a.apk
+          else
+            # arm64-only APK (no universal) — Gradle default signing (v2/v3) is enough
+            flutter build apk --release --split-per-abi --target-platform android-arm64 $args
+            cp build/app/outputs/flutter-apk/app-arm64-v8a-release.apk dist/granth-arm64-v8a.apk
+            flutter build appbundle --release $args
+            cp build/app/outputs/bundle/release/app-release.aab dist/granth.aab
+          fi
+          rm -f "$RUNNER_TEMP/dd.json"
+
+      - name: Verify Satlok signing (no forced v1)
+        if: env.DO_SIGN == 'true'
+        run: |
+          set -euo pipefail
+          BT="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+          out="$("$BT/apksigner" verify -v --print-certs dist/granth-arm64-v8a.apk)"
+          echo "$out" | grep -E "Verified using v[23] scheme|SHA-256 digest" || true
+          echo "$out" | grep -q "certificate SHA-256 digest: $EXPECTED_SHA256" \
+            || { echo "::error::APK certificate SHA-256 mismatch"; exit 1; }
+          # t430: the Satlok signer, spelled out (starts 68C7CF34 … ends 8D0EDDDE). Only the
+          # public certificate digest is read; no secret is printed.
+          signer="$(echo "$out" | grep -m1 -oiE 'certificate SHA-256 digest: [0-9a-f]{64}' | awk '{print toupper($NF)}')"
+          case "$signer" in 68C7CF34*8D0EDDDE) echo "Signer SHA-256 ${signer:0:8}…${signer: -8} = Satlok" ;; *) echo "::error::signer is not Satlok (${signer:0:8}…${signer: -8})"; exit 1 ;; esac
+          if [ -f shorebird.yaml ] && [ "$DO_SHOREBIRD" = "true" ]; then
+            unzip -l dist/granth-arm64-v8a.apk | grep -q 'shorebird.yaml' || { echo "::error::APK is not a Shorebird build"; exit 1; }
+          fi
+          echo "APK Satlok cert OK (Gradle default v2/v3; v1 not required)"
+          "$BT/aapt2" dump badging dist/granth-arm64-v8a.apk > "$RUNNER_TEMP/badging.txt"
+          badge="$(grep -m1 '^package:' "$RUNNER_TEMP/badging.txt")"
+          echo "$badge"
+          echo "$badge" | grep -q "name='$EXPECTED_PACKAGE' versionCode='3' versionName='1.0.2'" \
+            || { echo "::error::APK package/version is not $EXPECTED_PACKAGE 3 / 1.0.2"; exit 1; }
+
+      - name: Play Console checks on the AAB
+        if: env.DO_SIGN == 'true'
+        run: |
+          set -euo pipefail
+          AAB=dist/granth.aab
+          fail(){ echo "::error::$1"; exit 1; }
+          # 1) Signed with the Satlok key
+          jarsigner -verify "$AAB" | grep -q "jar verified" || fail "AAB jarsigner -verify failed"
+          echo "jarsigner: jar verified"
+          keytool -printcert -jarfile "$AAB" | tr -d ':' | tr 'A-Z' 'a-z' | grep -q "sha256 $EXPECTED_SHA256" \
+            || fail "AAB certificate SHA-256 mismatch"
+          echo "AAB cert SHA-256 matches $EXPECTED_SHA256"
+          # Merged manifest via bundletool
+          curl -sSfL -o "$RUNNER_TEMP/bundletool.jar" https://github.com/google/bundletool/releases/download/1.17.2/bundletool-all-1.17.2.jar
+          java -jar "$RUNNER_TEMP/bundletool.jar" dump manifest --bundle "$AAB" > "$RUNNER_TEMP/manifest.xml"
+          M="$RUNNER_TEMP/manifest.xml"
+          tsdk=$(grep -oP 'android:targetSdkVersion="\K[0-9]+' "$M" | head -1)
+          vc=$(grep -oP 'android:versionCode="\K[0-9]+' "$M" | head -1)
+          vn=$(grep -oP 'android:versionName="\K[^"]+' "$M" | head -1)
+          pkg=$(grep -oP '<manifest[^>]*package="\K[^"]+' "$M" | head -1)
+          echo "package=$pkg targetSdk=$tsdk versionCode=$vc versionName=$vn"
+          [ "$pkg" = "$EXPECTED_PACKAGE" ] || fail "package $pkg != $EXPECTED_PACKAGE"
+          [ "${tsdk:-0}" -ge 35 ] || fail "targetSdk $tsdk < 35"
+          # Every provider authority / custom permission must sit under the new id (Play rejected
+          # com.granth.app.androidx-startup / .firebaseinitprovider as owned by another developer).
+          if grep -oP '(android:authorities|android:name)="\Kcom\.granth\.app\.[^"]+' "$M" | grep -v '^com\.granth\.app\.user' \
+               | grep -vE '^com\.granth\.app\.[A-Z][A-Za-z]+$'; then
+            fail "authority/permission under plain com.granth.app (must be $EXPECTED_PACKAGE.*)"
+          fi
+          grep -oP 'android:authorities="\K[^"]+' "$M" | while read -r a; do
+            case "$a" in "$EXPECTED_PACKAGE".*) ;; *) echo "::error::authority $a not under $EXPECTED_PACKAGE"; exit 1;; esac
+          done || fail "provider authority outside $EXPECTED_PACKAGE"
+          echo "all provider authorities under $EXPECTED_PACKAGE"
+          [ "$vc" = "2" ] || fail "versionCode $vc != 2"
+          [ "$vn" = "1.0.2" ] || fail "versionName $vn != 1.0.2"
+          if grep -E 'uses-permission[^>]*(AD_ID|ACCESS_ADSERVICES_)' "$M"; then fail "AD_ID / ADSERVICES permission in merged manifest"; fi
+          echo "no AD_ID / ACCESS_ADSERVICES_* permissions"
+          if grep -q 'android:debuggable="true"' "$M"; then fail "debuggable=true in manifest"; fi
+          echo "not debuggable"
+          # 16 KB page alignment of every 64-bit native library (Play requirement)
+          rm -rf "$RUNNER_TEMP/aablib"; mkdir -p "$RUNNER_TEMP/aablib"
+          unzip -q "$AAB" 'base/lib/*' -d "$RUNNER_TEMP/aablib" || true
+          n=0
+          while IFS= read -r so; do
+            n=$((n+1))
+            bad=$(readelf -lW "$so" | awk '$1=="LOAD"{a=strtonum($NF); if (a<16384) print $NF}')
+            [ -z "$bad" ] || fail "$(basename "$so") not 16KB aligned ($bad)"
+          done < <(find "$RUNNER_TEMP/aablib" -name '*.so' \( -path '*/arm64-v8a/*' -o -path '*/x86_64/*' \))
+          [ "$n" -gt 0 ] || fail "no native libraries found in AAB"
+          echo "all $n native libraries are 16KB page aligned"
+          # The AAB really is a valid bundle that unpacks into installable APKs (t370)
+          java -jar "$RUNNER_TEMP/bundletool.jar" validate --bundle "$AAB" > /dev/null || fail "bundletool validate failed"
+          java -jar "$RUNNER_TEMP/bundletool.jar" build-apks --bundle "$AAB" --output "$RUNNER_TEMP/check.apks" --mode universal --overwrite \
+            || fail "bundletool build-apks failed"
+          unzip -l "$RUNNER_TEMP/check.apks" | grep -q 'universal.apk' || fail "build-apks produced no universal.apk"
+          rm -f "$RUNNER_TEMP/check.apks"
+          echo "bundletool validate + build-apks OK"
+          # Direct (unzipped) copies: the browser download is the .aab / .apk itself, not a zip.
+          cp "$AAB" "dist/Playstore-1.0.2.aab"
+          cp dist/granth-arm64-v8a.apk "dist/Playstore-1.0.2-arm64.apk"
+
+      # t408: exactly TWO artifacts, each the bare file (upload-artifact v7 archive:false, no
+      # zip, no side files): Playstore-1.0.1-arm64.apk (install on a phone) and
+      # Playstore-1.0.1.aab (upload to Play Console). The old zipped granth-flutter-* copies
+      # are gone (nothing depended on them).
+      - uses: actions/upload-artifact@v7
+        if: env.DO_SIGN == 'true'
+        with:
+          path: dist/Playstore-1.0.2.aab
+          archive: false
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v7
+        if: env.DO_SIGN == 'true'
+        with:
+          path: dist/Playstore-1.0.2-arm64.apk
+          archive: false
+          if-no-files-found: error
+
+      # Emulator / screenshot copy only (x86_64): built AFTER the two release files were copied
+      # to dist/, so it never touches them. Not for phones or Play; never fails the run.
+      - name: Emulator APK (x86_64, testing only)
+        if: env.DO_SIGN == 'true'
+        continue-on-error: true
+        env:
+          APP_KEY: ${{ secrets.APP_KEY }}
+        run: |
+          set +x
+          args=""
+          if [ -n "$APP_KEY" ]; then
+            printf '{"APP_KEY":"%s"}' "$APP_KEY" > "$RUNNER_TEMP/dd.json"
+            args="--dart-define-from-file=$RUNNER_TEMP/dd.json"
+          fi
+          flutter build apk --release --split-per-abi --target-platform android-x64 $args
+          mkdir -p emu
+          cp build/app/outputs/flutter-apk/app-x86_64-release.apk emu/Emulator-x86_64-1.0.2.apk
+          rm -f "$RUNNER_TEMP/dd.json"
+
+      - uses: actions/upload-artifact@v7
+        if: env.DO_SIGN == 'true'
+        continue-on-error: true
+        with:
+          path: emu/Emulator-x86_64-1.0.2.apk
+          archive: false
+          if-no-files-found: warn
+
+      - name: Remove signing material
+        if: always()
+        run: rm -f android/key.properties android/app/google-services.json "$RUNNER_TEMP/satlok.keystore" "$RUNNER_TEMP/dd.json"
+
+  # t430 (Goutam): desktop + iOS builds. Separate jobs, so they never block the Android
+  # release files above; continue-on-error while they are new. Both are UNSIGNED.
+  windows:
+    runs-on: windows-latest
+    continue-on-error: true
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.47.7
+          cache: true
+      - name: Enable Windows desktop (platform folder is committed; created only if missing)
+        shell: bash
+        run: |
+          flutter config --enable-windows-desktop
+          [ -d windows ] || flutter create --platforms=windows --org com.granth.app --project-name granthprabandhan .
+      - run: flutter pub get
+      - name: Build Windows (release, unsigned)
+        shell: bash
+        run: flutter build windows --release
+      - name: Zip
+        shell: pwsh
+        run: |
+          $v = ((Select-String -Path pubspec.yaml -Pattern '^version:\s*([0-9.]+)').Matches[0].Groups[1].Value)
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath "dist/Granth-Windows-$v.zip" -Force
+          "GRANTH_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - uses: actions/upload-artifact@v7
+        with:
+          path: dist/Granth-Windows-${{ env.GRANTH_VERSION }}.zip
+          archive: false
+          if-no-files-found: error
+
+  ios:
+    runs-on: macos-latest
+    continue-on-error: true
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.47.7
+          cache: true
+      - name: iOS platform folder (committed; created only if missing)
+        run: |
+          [ -d ios ] || flutter create --platforms=ios --org com.granth.app --project-name granthprabandhan .
+      - run: flutter pub get
+      - name: Build iOS (release, no codesign)
+        run: flutter build ios --release --no-codesign
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          v="$(sed -nE 's/^version:[[:space:]]*([0-9.]+).*/\1/p' pubspec.yaml)"
+          echo "GRANTH_VERSION=$v" >> "$GITHUB_ENV"
+          rm -rf Payload dist && mkdir -p Payload dist
+          cp -R build/ios/iphoneos/Runner.app Payload/
+          zip -qry "dist/Granth-iOS-$v-unsigned.ipa" Payload
+          ls -la dist
+      - uses: actions/upload-artifact@v7
+        with:
+          path: dist/Granth-iOS-${{ env.GRANTH_VERSION }}-unsigned.ipa
+          archive: false
+          if-no-files-found: error
